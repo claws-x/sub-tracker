@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<model version="1.0" type="com.apple.xcode.coredata" name="SubTracker" minimumOSVersion="16.0">
+  <entity name="Subscription" representedClassName="Subscription">
+    <attribute name="id" attributeType="UUID" optional="NO"/>
+    <attribute name="name" attributeType="String" optional="NO"/>
+    <attribute name="category" attributeType="String" optional="NO"/>
+    <attribute name="price" attributeType="Double" optional="NO"/>
+    <attribute name="currency" attributeType="String" optional="NO"/>
+    <attribute name="billingCycle" attributeType="String" optional="NO"/>
+    <attribute name="nextBillingDate" attributeType="Date" optional="NO"/>
+    <attribute name="notes" attributeType="String"/>
+    <attribute name="reminderEnabled" attributeType="Boolean" optional="NO"/>
+    <attribute name="createdAt" attributeType="Date" optional="NO"/>
+  </entity>
+</model>
