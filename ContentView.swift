@@ -10,140 +10,235 @@ import CoreData
 
 struct ContentView: View {
     @Environment(\.managedObjectContext) private var viewContext
-    @Environment(\.colorScheme) var colorScheme
-    @State private var showingAddSubscription = false
-    
+    @State private var activeSheet: SubscriptionSheet?
+
     @FetchRequest(
         sortDescriptors: [NSSortDescriptor(keyPath: \Subscription.nextBillingDate, ascending: true)],
-        animation: .default)
+        animation: .default
+    )
     private var subscriptions: FetchedResults<Subscription>
-    
-    var monthlyTotal: Double {
+
+    private var monthlyTotal: Double {
         subscriptions.reduce(0) { $0 + $1.monthlyPrice }
     }
-    
-    var yearlyTotal: Double {
-        monthlyTotal * 12
+
+    private var yearlyTotal: Double {
+        subscriptions.reduce(0) { $0 + $1.yearlyPrice }
     }
-    
+
+    private var activeReminders: Int {
+        subscriptions.filter(\.reminderEnabled).count
+    }
+
+    private var upcomingRenewals: [Subscription] {
+        subscriptions.filter { $0.daysRemaining <= 7 }
+    }
+
     var body: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                // 支出统计卡片
-                ExpenseSummaryCard(monthly: monthlyTotal, yearly: yearlyTotal)
-                
-                // 订阅列表
-                List(subscriptions) { sub in
-                    SubscriptionRow(subscription: sub)
+        NavigationStack {
+            Group {
+                if subscriptions.isEmpty {
+                    EmptySubscriptionsView {
+                        activeSheet = .add
+                    }
+                } else {
+                    List {
+                        Section {
+                            ExpenseSummaryCard(
+                                subscriptionCount: subscriptions.count,
+                                monthly: monthlyTotal,
+                                yearly: yearlyTotal,
+                                remindersEnabled: activeReminders
+                            )
+                            .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 8, trailing: 16))
+                            .listRowBackground(Color.clear)
+                        }
+
+                        if !upcomingRenewals.isEmpty {
+                            Section("7 天内即将续费") {
+                                ForEach(upcomingRenewals) { sub in
+                                    SubscriptionRow(subscription: sub)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            activeSheet = .edit(sub.objectID)
+                                        }
+                                }
+                            }
+                        }
+
+                        Section("全部订阅") {
+                            ForEach(subscriptions) { sub in
+                                SubscriptionRow(subscription: sub)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        activeSheet = .edit(sub.objectID)
+                                    }
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                    .scrollContentBackground(.hidden)
+                    .background(Color(.systemGroupedBackground))
                 }
-                .listStyle(.plain)
             }
-            .navigationTitle("订阅管家")
+            .navigationTitle("SubTracker")
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button(action: { showingAddSubscription = true }) {
-                        Image(systemName: "plus")
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        activeSheet = .add
+                    } label: {
+                        Label("添加订阅", systemImage: "plus")
                     }
                 }
             }
-            .sheet(isPresented: $showingAddSubscription) {
-                AddSubscriptionView()
+            .sheet(item: $activeSheet) { destination in
+                switch destination {
+                case .add:
+                    AddSubscriptionView()
+                        .environment(\.managedObjectContext, viewContext)
+                case .edit(let objectID):
+                    SubscriptionEditorSheet(objectID: objectID)
+                        .environment(\.managedObjectContext, viewContext)
+                }
             }
         }
     }
 }
 
-/// 支出统计卡片
+private enum SubscriptionSheet: Identifiable {
+    case add
+    case edit(NSManagedObjectID)
+
+    var id: String {
+        switch self {
+        case .add:
+            return "add"
+        case .edit(let objectID):
+            return objectID.uriRepresentation().absoluteString
+        }
+    }
+}
+
+private struct SubscriptionEditorSheet: View {
+    @Environment(\.managedObjectContext) private var viewContext
+
+    let objectID: NSManagedObjectID
+
+    var body: some View {
+        if let subscription = try? viewContext.existingObject(with: objectID) as? Subscription {
+            AddSubscriptionView(subscription: subscription)
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.orange)
+                Text("订阅不存在")
+                    .font(.headline)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+}
+
 struct ExpenseSummaryCard: View {
+    let subscriptionCount: Int
     let monthly: Double
     let yearly: Double
-    
+    let remindersEnabled: Int
+
     var body: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 20) {
-                // 月度支出
-                VStack(alignment: .leading) {
-                    Text("月度支出")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Text("¥\(monthly, specifier: "%.2f")")
-                        .font(.title2)
-                        .fontWeight(.bold)
-                }
-                
-                Divider()
-                
-                // 年度支出
-                VStack(alignment: .leading) {
-                    Text("年度支出")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Text("¥\(yearly, specifier: "%.2f")")
-                        .font(.title2)
-                        .fontWeight(.bold)
-                }
+        VStack(alignment: .leading, spacing: 16) {
+            Text("订阅概览")
+                .font(.headline)
+
+            HStack(alignment: .top) {
+                metricView(title: "月均支出", value: monthly.formattedCurrency())
+                Spacer()
+                metricView(title: "年均支出", value: yearly.formattedCurrency())
             }
-            .padding()
+
+            Divider()
+
+            HStack {
+                Label("\(subscriptionCount) 个活跃订阅", systemImage: "creditcard")
+                Spacer()
+                Label("\(remindersEnabled) 个提醒已启用", systemImage: "bell")
+            }
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
         }
-        .background(Color(.systemGray6))
-        .cornerRadius(12)
-        .padding()
+        .padding(20)
+        .background(
+            LinearGradient(
+                colors: [Color.blue.opacity(0.14), Color.cyan.opacity(0.08)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private func metricView(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.weight(.semibold))
+        }
     }
 }
 
-/// 订阅行视图
 struct SubscriptionRow: View {
     @Environment(\.managedObjectContext) private var viewContext
     @State private var showingDeleteAlert = false
+
     let subscription: Subscription
-    
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 12) {
-                // 类别图标
-                Image(systemName: subscription.categoryIcon)
-                    .font(.title2)
-                    .frame(width: 44, height: 44)
-                    .background(Color.blue.opacity(0.1))
-                    .cornerRadius(8)
-                
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(subscription.name)
-                        .font(.headline)
-                    
-                    HStack(spacing: 8) {
-                        Text("¥\(subscription.price, specifier: "%.2f")/\(subscription.billingCycleText)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
-                        Text("•")
-                            .foregroundColor(.secondary)
-                        
-                        Text(subscription.category)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+        HStack(spacing: 12) {
+            Image(systemName: subscription.categoryIcon)
+                .font(.title3)
+                .frame(width: 44, height: 44)
+                .background(statusColor.opacity(0.14))
+                .foregroundStyle(statusColor)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(subscription.name)
+                    .font(.headline)
+
+                HStack(spacing: 8) {
+                    Text("\(subscription.priceText)/\(subscription.billingCycleOption.shortLabel)")
+                    Text("•")
+                    Text(subscription.category)
                 }
-                
-                Spacer()
-                
-                VStack(alignment: .trailing, spacing: 4) {
-                    Text(subscription.statusText)
-                        .font(.caption)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 2)
-                        .background(statusColor)
-                        .foregroundColor(.white)
-                        .cornerRadius(4)
-                    
-                    Text("¥\(subscription.monthlyPrice, specifier: "%.2f")/月")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text("下次续费 \(subscription.nextBillingDateText) · \(subscription.nextBillingRelativeText)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 6) {
+                Text(subscription.statusText)
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(statusColor)
+                    .foregroundStyle(.white)
+                    .clipShape(Capsule())
+
+                Text("\(subscription.monthlyPriceText)/月")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 4)
-        .swipeActions(edge: .trailing) {
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button(role: .destructive) {
                 showingDeleteAlert = true
             } label: {
@@ -153,6 +248,7 @@ struct SubscriptionRow: View {
         .alert("删除订阅", isPresented: $showingDeleteAlert) {
             Button("取消", role: .cancel) {}
             Button("删除", role: .destructive) {
+                NotificationManager.shared.cancelReminders(for: subscription)
                 viewContext.delete(subscription)
                 try? viewContext.save()
             }
@@ -160,11 +256,11 @@ struct SubscriptionRow: View {
             Text("确定要删除「\(subscription.name)」吗？")
         }
     }
-    
-    var statusColor: Color {
+
+    private var statusColor: Color {
         if subscription.daysRemaining <= 0 {
             return .red
-        } else if subscription.daysRemaining <= 1 {
+        } else if subscription.daysRemaining <= 3 {
             return .orange
         } else if subscription.daysRemaining <= 7 {
             return .yellow
@@ -174,23 +270,48 @@ struct SubscriptionRow: View {
     }
 }
 
-// MARK: - Helpers
-extension Subscription {
-    var categoryIcon: String {
-        SubscriptionCategory.allCases.first { $0.rawValue == category }?.icon ?? "bag"
-    }
-    
-    var billingCycleText: String {
-        switch billingCycle {
-        case "weekly": return "周"
-        case "monthly": return "月"
-        case "yearly": return "年"
-        default: return "月"
+private struct EmptySubscriptionsView: View {
+    let addAction: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "calendar.badge.clock")
+                .font(.system(size: 44))
+                .foregroundStyle(.blue)
+
+            VStack(spacing: 8) {
+                Text("先添加你的第一个订阅")
+                    .font(.title3.weight(.semibold))
+                Text("记录周期、价格和下次扣费时间，避免忘记取消自动续费。")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+
+            Button("添加订阅", action: addAction)
+                .buttonStyle(.borderedProminent)
         }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemGroupedBackground))
     }
 }
 
-// MARK: - Preview
+private extension Subscription {
+    var categoryIcon: String {
+        SubscriptionCategory.allCases.first { $0.rawValue == category }?.icon ?? "bag"
+    }
+}
+
+private extension Double {
+    func formattedCurrency() -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.locale = Locale.current
+        return formatter.string(from: NSNumber(value: self)) ?? String(format: "%.2f", self)
+    }
+}
+
 struct ContentView_Previews: PreviewProvider {
     static var previews: some View {
         ContentView()

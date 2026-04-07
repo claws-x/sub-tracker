@@ -8,100 +8,115 @@
 import Foundation
 import UserNotifications
 
-/// 通知管理器
-class NotificationManager {
+enum ReminderSyncResult {
+    case success
+    case disabled
+    case permissionDenied
+    case failure(String)
+}
+
+final class NotificationManager {
     static let shared = NotificationManager()
-    
+
+    private let center = UNUserNotificationCenter.current()
+
     private init() {}
-    
-    /// 请求通知权限
-    func requestAuthorization(completion: @escaping (Bool) -> Void) {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
-            if let error = error {
-                print("通知权限请求失败：\(error.localizedDescription)")
-                completion(false)
-                return
+
+    func authorizationStatus() async -> UNAuthorizationStatus {
+        let settings = await center.notificationSettings()
+        return settings.authorizationStatus
+    }
+
+    func requestAuthorizationIfNeeded() async -> UNAuthorizationStatus {
+        let currentStatus = await authorizationStatus()
+
+        guard currentStatus == .notDetermined else {
+            return currentStatus
+        }
+
+        do {
+            _ = try await center.requestAuthorization(options: [.alert, .sound, .badge])
+        } catch {
+            return .denied
+        }
+
+        return await authorizationStatus()
+    }
+
+    func syncReminders(for sub: Subscription) async -> ReminderSyncResult {
+        cancelReminders(for: sub)
+
+        guard sub.reminderEnabled else {
+            return .disabled
+        }
+
+        let status = await requestAuthorizationIfNeeded()
+        guard status == .authorized || status == .provisional || status == .ephemeral else {
+            return .permissionDenied
+        }
+
+        do {
+            let scheduleDates = reminderDates(for: sub.nextBillingDate)
+            for item in scheduleDates {
+                try await addReminder(for: sub, offsetDays: item.offsetDays, date: item.date)
             }
-            completion(granted)
+            return .success
+        } catch {
+            return .failure(error.localizedDescription)
         }
     }
-    
-    /// 为订阅设置续费提醒
-    func scheduleReminder(for sub: Subscription) {
-        let billingDate = sub.nextBillingDate
-        
-        // 续费前 7 天提醒
-        if let date7 = Calendar.current.date(byAdding: .day, value: -7, to: billingDate) {
-            scheduleNotification(
-                for: sub,
-                date: date7,
-                identifier: "\(sub.id.uuidString)_7days",
-                title: "订阅即将续费",
-                body: "「\(sub.name)」将在 7 天后续费，费用 ¥\(sub.price)"
-            )
-        }
-        
-        // 续费前 3 天提醒
-        if let date3 = Calendar.current.date(byAdding: .day, value: -3, to: billingDate) {
-            scheduleNotification(
-                for: sub,
-                date: date3,
-                identifier: "\(sub.id.uuidString)_3days",
-                title: "订阅即将续费",
-                body: "「\(sub.name)」将在 3 天后续费，费用 ¥\(sub.price)"
-            )
-        }
-        
-        // 续费前 1 天提醒
-        if let date1 = Calendar.current.date(byAdding: .day, value: -1, to: billingDate) {
-            scheduleNotification(
-                for: sub,
-                date: date1,
-                identifier: "\(sub.id.uuidString)_1day",
-                title: "订阅明天续费",
-                body: "「\(sub.name)」将在明天续费，费用 ¥\(sub.price)"
-            )
+
+    func cancelReminders(for sub: Subscription) {
+        center.removePendingNotificationRequests(withIdentifiers: notificationIdentifiers(for: sub))
+    }
+
+    func cancelAllReminders() {
+        center.removeAllPendingNotificationRequests()
+    }
+
+    private func reminderDates(for billingDate: Date) -> [(offsetDays: Int, date: Date)] {
+        let calendar = Calendar.current
+        let reminderOffsets = [7, 3, 1]
+
+        return reminderOffsets.compactMap { offset in
+            guard let candidate = calendar.date(byAdding: .day, value: -offset, to: billingDate) else {
+                return nil
+            }
+
+            let scheduledDate = calendar.date(
+                bySettingHour: 9,
+                minute: 0,
+                second: 0,
+                of: candidate
+            ) ?? candidate
+
+            guard scheduledDate > Date() else {
+                return nil
+            }
+
+            return (offset, scheduledDate)
         }
     }
-    
-    /// 安排单个通知
-    private func scheduleNotification(for sub: Subscription,
-                                      date: Date,
-                                      identifier: String,
-                                      title: String,
-                                      body: String) {
+
+    private func addReminder(for sub: Subscription, offsetDays: Int, date: Date) async throws {
         let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
+        content.title = offsetDays == 1 ? "订阅明天续费" : "订阅即将续费"
+        content.body = "「\(sub.name)」将在 \(offsetDays) 天后续费，费用 \(sub.priceText)。"
         content.sound = .default
         content.userInfo = ["subscriptionId": sub.id.uuidString]
-        
+
         let triggerDate = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: date)
         let trigger = UNCalendarNotificationTrigger(dateMatching: triggerDate, repeats: false)
-        
-        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
-        
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error = error {
-                print("添加通知失败：\(error.localizedDescription)")
-            } else {
-                print("已为 \(sub.name) 设置提醒：\(title)")
-            }
-        }
+        let request = UNNotificationRequest(
+            identifier: "\(sub.id.uuidString)_\(offsetDays)days",
+            content: content,
+            trigger: trigger
+        )
+
+        try await center.add(request)
     }
-    
-    /// 取消某个订阅的所有提醒
-    func cancelReminders(for sub: Subscription) {
-        let identifiers = [
-            "\(sub.id.uuidString)_7days",
-            "\(sub.id.uuidString)_3days",
-            "\(sub.id.uuidString)_1day"
-        ]
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: identifiers)
-    }
-    
-    /// 取消所有提醒
-    func cancelAllReminders() {
-        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+
+    private func notificationIdentifiers(for sub: Subscription) -> [String] {
+        [7, 3, 1].map { "\(sub.id.uuidString)_\($0)days" }
     }
 }

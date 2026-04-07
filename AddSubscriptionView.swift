@@ -6,79 +6,104 @@
 //
 
 import SwiftUI
+import UserNotifications
 
 struct AddSubscriptionView: View {
     @Environment(\.managedObjectContext) private var viewContext
     @Environment(\.dismiss) private var dismiss
-    
-    @State private var name = ""
-    @State private var selectedCategory = SubscriptionCategory.video
-    @State private var price = ""
-    @State private var selectedCycle = BillingCycle.monthly
-    @State private var nextBillingDate = Date()
-    @State private var notes = ""
-    
+
+    private let subscription: Subscription?
+
+    @State private var name: String
+    @State private var selectedCategory: SubscriptionCategory
+    @State private var price: String
+    @State private var selectedCycle: BillingCycleOption
+    @State private var nextBillingDate: Date
+    @State private var notes: String
+    @State private var remindersEnabled: Bool
+
     @State private var showingAlert = false
     @State private var alertMessage = ""
-    
+    @State private var permissionStatus: UNAuthorizationStatus = .notDetermined
+    @State private var isSaving = false
+
+    init(subscription: Subscription? = nil) {
+        self.subscription = subscription
+        _name = State(initialValue: subscription?.name ?? "")
+        _selectedCategory = State(initialValue: SubscriptionCategory.allCases.first { $0.rawValue == subscription?.category } ?? .video)
+        _price = State(initialValue: subscription.map { String(format: "%.2f", $0.price) } ?? "")
+        _selectedCycle = State(initialValue: subscription.map { BillingCycleOption.fromPersistedValue($0.billingCycle) } ?? .monthly)
+        _nextBillingDate = State(initialValue: subscription?.nextBillingDate ?? Date())
+        _notes = State(initialValue: subscription?.notes ?? "")
+        _remindersEnabled = State(initialValue: subscription?.reminderEnabled ?? true)
+    }
+
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
-                // 基本信息
-                Section(header: Text("基本信息")) {
-                    TextField("订阅名称（如：Netflix）", text: $name)
-                    
+                Section("基本信息") {
+                    TextField("订阅名称，例如 Netflix", text: $name)
+
                     Picker("类别", selection: $selectedCategory) {
                         ForEach(SubscriptionCategory.allCases) { category in
-                            Text(category.rawValue).tag(category)
+                            Label(category.rawValue, systemImage: category.icon)
+                                .tag(category)
                         }
                     }
                 }
-                
-                // 价格信息
-                Section(header: Text("价格信息")) {
-                    TextField("价格（如：9.99）", text: $price)
+
+                Section("价格信息") {
+                    TextField("价格", text: $price)
                         .keyboardType(.decimalPad)
-                    
+
                     Picker("计费周期", selection: $selectedCycle) {
-                        ForEach(BillingCycle.allCases) { cycle in
-                            Text(cycle.rawValue).tag(cycle)
+                        ForEach(BillingCycleOption.allCases) { cycle in
+                            Text(cycle.title).tag(cycle)
                         }
                     }
                 }
-                
-                // 续费日期
-                Section(header: Text("续费日期")) {
+
+                Section("续费信息") {
                     DatePicker("下次续费日期", selection: $nextBillingDate, displayedComponents: .date)
+
+                    if let parsedPrice {
+                        LabeledContent("折算月均") {
+                            Text(
+                                (parsedPrice * selectedCycle.monthlyMultiplier).formattedCurrency(
+                                    code: Locale.current.currency?.identifier ?? "USD"
+                                )
+                            )
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
-                
-                // 备注
-                Section(header: Text("备注（可选）")) {
-                    TextField("备注信息", text: $notes, axis: .vertical)
-                }
-                
-                // 提醒设置
-                Section(header: Text("提醒设置")) {
-                    Toggle("启用续费提醒", isOn: .constant(true))
-                    Text("将在续费前 7 天、3 天、1 天发送通知")
+
+                Section("提醒") {
+                    Toggle("启用续费提醒", isOn: $remindersEnabled)
+
+                    Text(reminderFootnote)
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("备注") {
+                    TextField("可记录套餐说明、家庭共享等信息", text: $notes, axis: .vertical)
                 }
             }
-            .navigationTitle("添加订阅")
+            .navigationTitle(subscription == nil ? "添加订阅" : "编辑订阅")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
+                ToolbarItem(placement: .topBarLeading) {
                     Button("取消") {
                         dismiss()
                     }
                 }
-                
-                ToolbarItem(placement: .navigationBarTrailing) {
+
+                ToolbarItem(placement: .topBarTrailing) {
                     Button("保存") {
                         saveSubscription()
                     }
-                    .disabled(name.isEmpty || price.isEmpty)
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || parsedPrice == nil || isSaving)
                 }
             }
             .alert("提示", isPresented: $showingAlert) {
@@ -86,54 +111,102 @@ struct AddSubscriptionView: View {
             } message: {
                 Text(alertMessage)
             }
+            .task {
+                permissionStatus = await NotificationManager.shared.authorizationStatus()
+            }
+            .onChange(of: remindersEnabled) { newValue in
+                guard newValue else { return }
+                Task {
+                    let status = await NotificationManager.shared.requestAuthorizationIfNeeded()
+                    await MainActor.run {
+                        permissionStatus = status
+                        if status == .denied {
+                            remindersEnabled = false
+                            alertMessage = "通知权限未开启。你仍可保存订阅，但需要在系统设置中允许通知后才能收到续费提醒。"
+                            showingAlert = true
+                        }
+                    }
+                }
+            }
         }
     }
-    
+
+    private var parsedPrice: Double? {
+        Double(price.replacingOccurrences(of: ",", with: "."))
+    }
+
+    private var reminderFootnote: String {
+        switch permissionStatus {
+        case .authorized, .provisional, .ephemeral:
+            return "会在续费前 7 天、3 天、1 天安排本地提醒。"
+        case .denied:
+            return "系统通知权限已关闭。保存后不会发送提醒，需前往系统设置开启。"
+        case .notDetermined:
+            return "开启后会请求系统通知权限。"
+        @unknown default:
+            return "提醒状态未知，保存后会尝试同步。"
+        }
+    }
+
     private func saveSubscription() {
-        guard !name.isEmpty else {
-            alertMessage = "请输入订阅名称"
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedName.isEmpty else {
+            alertMessage = "请输入订阅名称。"
             showingAlert = true
             return
         }
-        
-        guard let priceValue = Double(price), priceValue > 0 else {
-            alertMessage = "请输入有效价格"
+
+        guard let priceValue = parsedPrice, priceValue > 0 else {
+            alertMessage = "请输入有效价格。"
             showingAlert = true
             return
         }
-        
-        let sub = Subscription(context: viewContext)
-        sub.id = UUID()
-        sub.name = name
-        sub.category = selectedCategory.rawValue
-        sub.price = priceValue
-        sub.currency = "CNY"
-        sub.billingCycle = selectedCycle.rawValue
-        sub.nextBillingDate = nextBillingDate
-        sub.notes = notes.isEmpty ? nil : notes
-        sub.reminderEnabled = true
-        sub.createdAt = Date()
-        
+
+        isSaving = true
+
+        let target = subscription ?? Subscription(context: viewContext)
+        if subscription == nil {
+            target.id = UUID()
+            target.createdAt = Date()
+        }
+
+        target.name = trimmedName
+        target.category = selectedCategory.rawValue
+        target.price = priceValue
+        target.currency = Locale.current.currency?.identifier ?? "USD"
+        target.billingCycle = selectedCycle.rawValue
+        target.nextBillingDate = nextBillingDate
+        target.notes = notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : notes
+        target.reminderEnabled = remindersEnabled
+
         do {
             try viewContext.save()
-            
-            // 设置提醒
-            scheduleReminder(for: sub)
-            
-            dismiss()
+
+            Task {
+                let syncResult = await NotificationManager.shared.syncReminders(for: target)
+                await MainActor.run {
+                    isSaving = false
+                    switch syncResult {
+                    case .success, .disabled:
+                        dismiss()
+                    case .permissionDenied:
+                        alertMessage = "订阅已保存，但当前没有通知权限，因此未能安排续费提醒。"
+                        showingAlert = true
+                    case .failure(let message):
+                        alertMessage = "订阅已保存，但提醒同步失败：\(message)"
+                        showingAlert = true
+                    }
+                }
+            }
         } catch {
+            isSaving = false
             alertMessage = "保存失败：\(error.localizedDescription)"
             showingAlert = true
         }
     }
-    
-    private func scheduleReminder(for sub: Subscription) {
-        // 简化实现，实际应使用 UserNotifications
-        print("将为 \(sub.name) 设置续费提醒")
-    }
 }
 
-// MARK: - Preview
 struct AddSubscriptionView_Previews: PreviewProvider {
     static var previews: some View {
         AddSubscriptionView()
